@@ -11,6 +11,48 @@
 # General formatCodes ranges from 0 to 81.
 #
 # 18.8.10 cellXfs (Cell Formats)
+import Base: isempty
+
+function CellValue(ws::Worksheet, val::CellValueType)
+    CellValue(val, default_cell_format(ws, val))
+end
+
+id(format::CellDataFormat) = string(format.id)
+id(::EmptyCellDataFormat) = ""
+isempty(::CellDataFormat) = false
+isempty(::EmptyCellDataFormat) = true
+
+# The number of predefined number formats in XLSX
+# Any custom number formats must have an id >= PREDEFINED_NUMFMT_COUNT
+const PREDEFINED_NUMFMT_COUNT = 164
+
+# these formats may appear differently in different editors
+const DEFAULT_DATE_numFmtId = 14 # dd-mm-yyyy
+const DEFAULT_TIME_numFmtId = 20 # h:mm
+const DEFAULT_DATETIME_numFmtId = 22 # dd-mm-yyyy h:mm
+
+"""
+Returns the default `CellDataFormat` for a type
+"""
+default_cell_format(::Worksheet, ::CellValueType) = EmptyCellDataFormat()
+default_cell_format(ws::Worksheet, ::Date) = get_num_style_index(ws, DEFAULT_DATE_numFmtId)
+default_cell_format(ws::Worksheet, ::Dates.Time) = get_num_style_index(ws, DEFAULT_TIME_numFmtId)
+default_cell_format(ws::Worksheet, ::Dates.DateTime) = get_num_style_index(ws, DEFAULT_DATETIME_numFmtId)
+
+# Attempts to get CellDataFormat associated with a numFmtId and sets a default style if it is not found
+# Use for ensuring default formats exist
+function get_num_style_index(ws::Worksheet, numformatid::Integer)
+    @assert numformatid >= 0 "Invalid number format id"
+
+    wb = get_workbook(ws)
+    style_index = styles_get_cellXf_with_numFmtId(wb, numformatid)
+    if isempty(style_index)
+        # adds default style <xf applyNumberFormat="1" borderId="0" fillId="0" fontId="0" numFmtId=formatid xfId="0"/>
+        style_index = styles_add_cell_xf(wb, Dict("applyNumberFormat"=>"1", "borderId"=>"0", "fillId"=>"0", "fontId"=>"0", "numFmtId"=>string(numformatid), "xfId"=>"0"))
+    end
+
+    return style_index
+end
 
 # get styles document for workbook
 function styles_xmlroot(workbook::Workbook)
@@ -49,6 +91,56 @@ function styles_cell_xf_numFmtId(wb::Workbook, index::Int) :: Int
 end
 
 """
+Defines a custom number format to render numbers, dates or text.
+Returns the index to be used as the `numFmtId` in a cellXf definition.
+"""
+function styles_add_numFmt(wb::Workbook, format_code::AbstractString) :: Integer
+    xroot = styles_xmlroot(wb)
+
+    numfmts = find(xroot, "/xpath:styleSheet/xpath:numFmts", SPREADSHEET_NAMESPACE_XPATH_ARG)
+    if isempty(numfmts)
+        stylesheet = findfirst(xroot, "/xpath:styleSheet", SPREADSHEET_NAMESPACE_XPATH_ARG)
+        numfmts = EzXML.addelement!(stylesheet, "numFmts")
+    else
+        numfmts = numfmts[1]
+    end
+
+    existing_numFmt_elements_count = EzXML.countelements(numfmts)
+    new_fmt = EzXML.addelement!(numfmts, "numFmt")
+
+    fmt_code = existing_numFmt_elements_count + PREDEFINED_NUMFMT_COUNT
+    new_fmt["numFmtId"] = fmt_code
+    new_fmt["formatCode"] = xlsxescape(format_code)
+
+    return fmt_code
+end
+
+const FontAttribute = Union{AbstractString, Pair{String, Pair{String, String}}}
+
+"""
+Defines a custom font. Returns the index to be used as the `fontId` in a cellXf definition.
+"""
+function styles_add_font(wb::Workbook, attributes::Vector{FontAttribute})
+    xroot = styles_xmlroot(wb)
+    fonts_element = findfirst(xroot, "/xpath:styleSheet/xpath:fonts", SPREADSHEET_NAMESPACE_XPATH_ARG)
+    existing_font_elements_count = EzXML.countelements(fonts_element)
+
+    new_font = EzXML.addelement!(fonts_element, "font")
+    for a in attributes
+        if a isa Pair
+            name, val = last(a)
+            attr = EzXML.addelement!(new_font, first(a))
+            attr[name] = val
+        else
+            EzXML.addelement!(new_font, a)
+        end
+    end
+
+    return existing_font_elements_count
+end
+
+
+"""
 Queries numFmt formatCode field by numFmtId.
 """
 function styles_numFmt_formatCode(wb::Workbook, numFmtId::AbstractString) :: String
@@ -60,6 +152,21 @@ end
 
 styles_numFmt_formatCode(wb::Workbook, numFmtId::Int) = styles_numFmt_formatCode(wb, string(numFmtId))
 
+const DATETIME_CODES = ["d", "m", "yy", "h", "s", "a/p", "am/pm"]
+
+function remove_formatting(code::AbstractString)
+    # this regex should cover all the formatting cases found here(colors/conditionals/quotes/spacing):
+    # https://support.office.com/en-us/article/create-or-delete-a-custom-number-format-78f2a361-936b-4c03-8772-09fab54be7f4
+    ignoredformatting = r"""
+        \[.{2,}?\]|
+        &quot;.+&quot;|
+        _.|
+        \\.|
+        \*.
+        """x
+    replace(code, ignoredformatting => "")
+end
+
 function styles_is_datetime(wb::Workbook, index::Int) :: Bool
     if !haskey(wb.buffer_styles_is_datetime, index)
         isdatetime = false
@@ -69,8 +176,9 @@ function styles_is_datetime(wb::Workbook, index::Int) :: Bool
         if (14 <= numFmtId && numFmtId <= 22) || (45 <= numFmtId && numFmtId <= 47)
             isdatetime = true
         elseif numFmtId > 81
-            code = styles_numFmt_formatCode(wb, numFmtId)
-            if contains(code, "dd") || contains(code, "mm") || contains(code, "yy") || contains(code, "hh") || contains(code, "ss")
+            code = lowercase(styles_numFmt_formatCode(wb, numFmtId))
+            code = remove_formatting(code)
+            if any(map(x->contains(code, x), DATETIME_CODES))
                 isdatetime = true
             end
         end
@@ -80,6 +188,8 @@ function styles_is_datetime(wb::Workbook, index::Int) :: Bool
 
     return wb.buffer_styles_is_datetime[index]
 end
+
+styles_is_datetime(wb::Workbook, fmt::CellDataFormat) = styles_is_datetime(wb, Int(fmt.id))
 
 function styles_is_datetime(wb::Workbook, index::AbstractString)
     @assert !isempty(index)
@@ -91,14 +201,21 @@ styles_is_datetime(ws::Worksheet, index) = styles_is_datetime(get_workbook(ws), 
 function styles_is_float(wb::Workbook, index::Int) :: Bool
     if !haskey(wb.buffer_styles_is_float, index)
         isfloat = false
-
         numFmtId = styles_cell_xf_numFmtId(wb, index)
 
         if numFmtId == 2 || numFmtId == 4 || (7 <= numFmtId && numFmtId <= 11) || numFmtId == 39 || numFmtId == 40 || numFmtId == 44 || numFmtId == 48
             isfloat = true
         elseif numFmtId > 81
             code = styles_numFmt_formatCode(wb, numFmtId)
-            if contains(code, ".0")
+            code = remove_formatting(code)
+
+            floatformats = r"""
+                \.[0#?]|
+                [0#?]e[+-]?[0#?]|
+                [0#?]/[0#?]|
+                %
+                """ix
+            if ismatch(floatformats, code)
                 isfloat = true
             end
         end
@@ -114,6 +231,7 @@ function styles_is_float(wb::Workbook, index::AbstractString)
     styles_is_float(wb, parse(Int, index))
 end
 
+styles_is_float(wb::Workbook, fmt::CellDataFormat) = styles_is_float(wb, Int(fmt.id))
 styles_is_float(ws::Worksheet, index) = styles_is_float(get_workbook(ws), index)
 
 """
@@ -131,28 +249,28 @@ Returns -1 if not found.
             <xf applyNumberFormat="1" borderId="0" fillId="0" fontId="0" numFmtId="22" xfId="0"/>
 ```
 """
-function styles_get_cellXf_with_numFmtId(wb::Workbook, numFmtId::Int) :: Int
+function styles_get_cellXf_with_numFmtId(wb::Workbook, numFmtId::Int) :: AbstractCellDataFormat
     xroot = styles_xmlroot(wb)
     elements_found = find(xroot, "/xpath:styleSheet/xpath:cellXfs/xpath:xf", SPREADSHEET_NAMESPACE_XPATH_ARG)
 
     if isempty(elements_found)
-        return -1
+        return EmptyCellDataFormat()
     else
         for i in 1:length(elements_found)
             el = elements_found[i]
             if haskey(el, "numFmtId")
                 if parse(Int, el["numFmtId"]) == numFmtId
-                    return i-1
+                    return CellDataFormat(i-1)
                 end
             end
         end
 
         # not found
-        return -1
+        return EmptyCellDataFormat()
     end
 end
 
-function styles_add_cell_xf(wb::Workbook, attributes::Dict{String, String}) :: Int
+function styles_add_cell_xf(wb::Workbook, attributes::Dict{String, String}) :: CellDataFormat
     xroot = styles_xmlroot(wb)
     cellXfs_element = findfirst(xroot, "/xpath:styleSheet/xpath:cellXfs", SPREADSHEET_NAMESPACE_XPATH_ARG)
     existing_cellxf_elements_count = EzXML.countelements(cellXfs_element)
@@ -162,5 +280,5 @@ function styles_add_cell_xf(wb::Workbook, attributes::Dict{String, String}) :: I
         new_xf[k] = attributes[k]
     end
 
-    return existing_cellxf_elements_count # turns out this is the new index
+    return CellDataFormat(existing_cellxf_elements_count) # turns out this is the new index
 end

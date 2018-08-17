@@ -2,7 +2,7 @@
 import XLSX
 using Base.Test, Missings
 
-data_directory = joinpath(dirname(@__FILE__), "..", "data")
+data_directory = joinpath(Pkg.dir("XLSX"), "data")
 
 ef_blank_ptbr_1904 = XLSX.readxlsx(joinpath(data_directory, "blank_ptbr_1904.xlsx"))
 ef_Book1 = XLSX.readxlsx(joinpath(data_directory, "Book1.xlsx"))
@@ -423,6 +423,7 @@ dt = Date(2018,4,1)
 
 # General number formats
 f = XLSX.openxlsx(joinpath(data_directory, "general.xlsx"))
+show(IOBuffer(), f)
 sheet = f["general"]
 @test sheet["A1"] == "text"
 @test sheet["B1"] == "regular text"
@@ -624,8 +625,8 @@ function check_test_data(data::Vector{Any}, test_data::Vector{Any})
     for row in 1:rows, col in 1:cols
         test_value = test_data[col][row]
         value = data[col][row]
-        if ismissing(test_value)
-            @test ismissing(value)
+        if ismissing(test_value) || ( isa(test_value, AbstractString) && isempty(test_value) )
+            @test ismissing(value) || ( isa(value, AbstractString) && isempty(value) )
         else
             if isa(test_value, Float64)
                 @test isapprox(value, test_value)
@@ -984,7 +985,7 @@ rm("output_table.xlsx")
 report_1_column_names = ["HEADER_A", "HEADER_B"]
 report_1_data = Vector{Any}(2)
 report_1_data[1] = [1, 2, 3]
-report_1_data[2] = ["A", "B", "C"]
+report_1_data[2] = ["A", "B", ""]
 
 report_2_column_names = ["COLUMN_A", "COLUMN_B"]
 report_2_data = Vector{Any}(2)
@@ -1004,4 +1005,320 @@ data, labels = XLSX.readtable("output_tables.xlsx", "REPORT_B")
 @test labels[2] == :COLUMN_B
 check_test_data(data, report_2_data)
 
+XLSX.writetable("output_tables.xlsx", [ ("REPORT_A", report_1_data, report_1_column_names), ("REPORT_B", report_2_data, report_2_column_names) ], rewrite=true)
+
+data, labels = XLSX.readtable("output_tables.xlsx", "REPORT_A")
+@test labels[1] == :HEADER_A
+@test labels[2] == :HEADER_B
+check_test_data(data, report_1_data)
+
+data, labels = XLSX.readtable("output_tables.xlsx", "REPORT_B")
+@test labels[1] == :COLUMN_A
+@test labels[2] == :COLUMN_B
+check_test_data(data, report_2_data)
+
+report_1_column_names = [:HEADER_A, :HEADER_B]
+report_2_column_names = [:COLUMN_A, :COLUMN_B]
+
+XLSX.writetable("output_tables.xlsx", [ ("REPORT_A", report_1_data, report_1_column_names), ("REPORT_B", report_2_data, report_2_column_names) ], rewrite=true)
+
+data, labels = XLSX.readtable("output_tables.xlsx", "REPORT_A")
+@test labels[1] == :HEADER_A
+@test labels[2] == :HEADER_B
+check_test_data(data, report_1_data)
+
+data, labels = XLSX.readtable("output_tables.xlsx", "REPORT_B")
+@test labels[1] == :COLUMN_A
+@test labels[2] == :COLUMN_B
+check_test_data(data, report_2_data)
+
 rm("output_tables.xlsx")
+
+using XLSX: CellValue, id, getcell, setdata!, CellRef
+xfile = XLSX.open_default_template()
+wb = XLSX.get_workbook(xfile)
+sheet = xfile["Sheet1"]
+
+datefmt = XLSX.styles_add_numFmt(wb, "yyyymmdd")
+numfmt = XLSX.styles_add_numFmt(wb, "\$* \#,\#\#0.00;\$* (\#,\#\#0.00);\$* \"-\"??;[Magenta]@")
+
+#Check format id numbers dont intersect with predefined formats or each other
+@test datefmt == 164
+@test numfmt == 165
+
+font = XLSX.styles_add_font(wb, XLSX.FontAttribute["b", "sz"=>("val"=>"24")])
+xroot = XLSX.styles_xmlroot(wb)
+fontnodes = find(xroot, "/xpath:styleSheet/xpath:fonts/xpath:font", XLSX.SPREADSHEET_NAMESPACE_XPATH_ARG)
+fontnode = fontnodes[font+1] # XML is zero indexed so we need to add 1 to get the right node
+
+# Check the font was written correctly
+@test string(fontnode) == "<font><b/><sz val=\"24\"/></font>"
+
+textstyle = XLSX.styles_add_cell_xf(wb, Dict("applyFont"=>"true", "fontId"=>"$font"))
+datestyle = XLSX.styles_add_cell_xf(wb, Dict("applyNumberFormat"=>"1", "numFmtId"=>"$datefmt"))
+numstyle = XLSX.styles_add_cell_xf(wb, Dict("applyFont"=>"1", "applyNumberFormat"=>"1", "fontId"=>"$font", "numFmtId"=>"$numfmt"))
+
+xf = XLSX.styles_get_cellXf_with_numFmtId(wb, 1000)
+@test xf == XLSX.EmptyCellDataFormat()
+@test isempty(xf)
+@test id(xf) == ""
+
+@test textstyle isa XLSX.CellDataFormat
+@test !isempty(textstyle)
+@test id(textstyle) == "1"
+
+@test XLSX.styles_get_cellXf_with_numFmtId(wb, datefmt) == datestyle
+@test XLSX.styles_numFmt_formatCode(wb, string(datefmt)) == "yyyymmdd"
+@test datestyle isa XLSX.CellDataFormat
+@test !isempty(datestyle)
+@test id(datestyle) == "2"
+
+@test XLSX.styles_get_cellXf_with_numFmtId(wb, numfmt) == numstyle
+@test XLSX.styles_numFmt_formatCode(wb, string(numfmt)) == "\$* \#,\#\#0.00;\$* (\#,\#\#0.00);\$* &quot;-&quot;??;[Magenta]@"
+@test numstyle isa XLSX.CellDataFormat
+@test !isempty(numstyle)
+@test id(numstyle) == "3"
+
+setdata!(sheet, CellRef("A1"), CellValue(Date(2011, 10, 13), datestyle))
+setdata!(sheet, CellRef("A2"), CellValue(1000, numstyle))
+setdata!(sheet, CellRef("A3"), CellValue(1000.10, numstyle))
+setdata!(sheet, CellRef("A4"), CellValue(-1000.10, numstyle))
+setdata!(sheet, CellRef("A5"), CellValue(0, numstyle))
+setdata!(sheet, CellRef("A6"), CellValue("hello", numstyle))
+setdata!(sheet, CellRef("B1"), CellValue("hello world", textstyle))
+
+@test sheet["A1"] == Date(2011, 10, 13)
+cell = getcell(sheet, "A1")
+@test cell.style == id(datestyle)
+formatid = XLSX.styles_cell_xf_numFmtId(wb, parse(Int, cell.style))
+@test formatid == datefmt
+
+cellstyle = getcell(sheet, "A2").style
+@test cellstyle == id(numstyle)
+formatid = XLSX.styles_cell_xf_numFmtId(wb, parse(Int, cellstyle))
+@test formatid == numfmt
+
+@test sheet["A2"] == 1000
+@test sheet["A3"] == 1000.10
+@test XLSX.getcell(sheet, "A3").style == cellstyle
+@test sheet["A4"] == -1000.10
+@test XLSX.getcell(sheet, "A4").style == cellstyle
+@test sheet["A5"] == 0
+@test XLSX.getcell(sheet, "A5").style == cellstyle
+@test sheet["A6"] == "hello"
+@test XLSX.getcell(sheet, "A6").style == cellstyle
+
+@test sheet["B1"] == "hello world"
+@test XLSX.getcell(sheet, "B1").style == id(textstyle)
+
+sheet["B2"] = CellValue("hello world", textstyle)
+@test sheet["B2"] == "hello world"
+@test XLSX.getcell(sheet, "B2").style == id(textstyle)
+
+# Check CellDataFormat only works with CellValues
+@test_throws MethodError XLSX.CellValue([1,2,3,4], textstyle)
+
+close(xfile)
+
+using XLSX: styles_is_datetime, styles_add_numFmt, styles_add_cell_xf
+# Capitalized and single character numfmts
+xfile = XLSX.open_default_template()
+wb = XLSX.get_workbook(xfile)
+sheet = xfile["Sheet1"]
+
+fmt = styles_add_numFmt(wb, "yyyy m d")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test styles_is_datetime(wb, style)
+
+fmt = styles_add_numFmt(wb, "h:m:s")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test styles_is_datetime(wb, style)
+
+fmt = styles_add_numFmt(wb, "0.00")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test !styles_is_datetime(wb, style)
+@test XLSX.styles_is_float(wb, style)
+
+fmt = styles_add_numFmt(wb, "[red]yyyy m d")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test styles_is_datetime(wb, style)
+fmt = styles_add_numFmt(wb, "[red] h:m:s")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test styles_is_datetime(wb, style)
+fmt = styles_add_numFmt(wb, "[red] 0.00; [magenta] 0.00")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test !styles_is_datetime(wb, style)
+@test XLSX.styles_is_float(wb, style)
+
+fmt = styles_add_numFmt(wb, "YYYY M D")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test styles_is_datetime(wb, style)
+fmt = styles_add_numFmt(wb, "H:M:S")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test styles_is_datetime(wb, style)
+
+fmt = styles_add_numFmt(wb, "m")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test styles_is_datetime(wb, style)
+
+fmt = styles_add_numFmt(wb, "M")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test styles_is_datetime(wb, style)
+
+fmt = styles_add_numFmt(wb, "y")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test !styles_is_datetime(wb, style)
+
+fmt = styles_add_numFmt(wb, "[s]")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test styles_is_datetime(wb, style)
+
+fmt = styles_add_numFmt(wb, "am/pm")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test styles_is_datetime(wb, style)
+
+fmt = styles_add_numFmt(wb, "a/p")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test styles_is_datetime(wb, style)
+
+fmt = styles_add_numFmt(wb, "\"Monday\"")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test !styles_is_datetime(wb, style)
+@test !XLSX.styles_is_float(wb, style)
+
+fmt = styles_add_numFmt(wb, "0.00*m")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test !styles_is_datetime(wb, style)
+@test XLSX.styles_is_float(wb, style)
+
+fmt = styles_add_numFmt(wb, "0.00_m")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test !styles_is_datetime(wb, style)
+@test XLSX.styles_is_float(wb, style)
+
+fmt = styles_add_numFmt(wb, "0.00\\d")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test !styles_is_datetime(wb, style)
+@test XLSX.styles_is_float(wb, style)
+
+fmt = styles_add_numFmt(wb, "[red][>1.5]000")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test !XLSX.styles_is_float(wb, style)
+
+fmt = styles_add_numFmt(wb, "0.#")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test XLSX.styles_is_float(wb, style)
+
+fmt = styles_add_numFmt(wb, "\"hello.\" ###")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test !XLSX.styles_is_float(wb, style)
+
+fmt = styles_add_numFmt(wb, ".??")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test XLSX.styles_is_float(wb, style)
+
+fmt = styles_add_numFmt(wb, "#e+00")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test XLSX.styles_is_float(wb, style)
+
+fmt = styles_add_numFmt(wb, "0e00")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test XLSX.styles_is_float(wb, style)
+
+fmt = styles_add_numFmt(wb, "# ??/??")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test XLSX.styles_is_float(wb, style)
+
+fmt = styles_add_numFmt(wb, "*.00")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test !XLSX.styles_is_float(wb, style)
+
+fmt = styles_add_numFmt(wb, "\\.00")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test !XLSX.styles_is_float(wb, style)
+
+fmt = styles_add_numFmt(wb, "00_.")
+style = styles_add_cell_xf(wb, Dict("numFmtId"=>"$fmt"))
+@test !XLSX.styles_is_float(wb, style)
+
+close(xfile)
+
+#
+# Write one row at a time
+#
+
+sheetname = "New Sheet"
+filename = "test_file.xlsx"
+if isfile(filename)
+    rm(filename)
+end
+
+data = [
+    1 "a" Date(2018, 1, 1);
+    2 missing Date(2018, 1, 2);
+    missing "c" Date(2018, 1, 3);
+]
+
+XLSX.openxlsx(filename, write=true) do xf
+    sheet = xf[1]
+    XLSX.rename!(sheet, sheetname)
+
+    sheet["A1"] = data[1, :]
+    sheet[2, :] = data[2, :]
+    sheet[2, 1] = "test overwrite"
+    sheet[3, 2:3] = data[3, 2:3]
+end
+
+@test isfile(filename)
+XLSX.openxlsx(filename) do xf
+    sheet = xf[sheetname]
+    read_data = sheet[:]
+
+    @test isequal(read_data[1, :], data[1, :])
+    @test isequal(read_data[2, :], vcat(["test overwrite"], data[2, 2:end]))
+    @test isequal(read_data[3, :], data[3, :])
+end
+
+# test overwrite file
+@test isfile(filename)
+new_data = [1 2 3;]
+XLSX.openxlsx(filename, write=true, read=false) do xf
+    sheet = xf[1]
+    sheet[1, :] = new_data[1,:]
+end
+
+XLSX.openxlsx(filename) do xf
+    sheet = xf[1]
+    read_data = sheet[:]
+
+    @test isequal(read_data, new_data)
+end
+
+# test edit file
+XLSX.openxlsx(filename, write=true, read=true) do xf
+    sheet=xf[1]
+    sheet[1, 2] = "hello"
+    sheet["B6"] = 5
+end
+
+XLSX.openxlsx(filename) do xf
+    sheet = xf[1]
+    read_data = sheet[:]
+
+    @test read_data[1, 1] == new_data[1, 1]
+    @test read_data[1, 2] == "hello"
+    @test read_data[1, 3] == new_data[1, 3]
+    @test read_data[6, 2] == 5
+end
+
+# test writing throws error if flag not set
+XLSX.openxlsx(filename) do xf
+    sheet = xf[1]
+    @test_throws AssertionError sheet[1, 1] = "failure"
+end
+
+xf = XLSX.emptyfile("page")
+@test XLSX.sheetnames(xf) == ["page"]
+close(xf)
+
+rm(filename)
